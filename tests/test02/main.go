@@ -135,7 +135,7 @@ func main() {
 	// Phase 1: Train Classifier
 	// ========================================
 	fmt.Println("═══ PHASE 1: Training Classifier (all terrains) ═══")
-	trainClassifier(classifier, 5*time.Second)
+	trainClassifier(classifier, 8*time.Second) // Longer training for classifier
 
 	// ========================================
 	// Phase 2: Train Navigators on ROAD ONLY
@@ -194,6 +194,7 @@ func createDriftConfig() *drift.Config {
 	cfg := drift.NewConfig("MultiTerrainNeuralLink")
 
 	// Classifier: 8 sensors → 4 terrain classes
+	// Hidden layer (index 1) outputs 16 neurons as neural link
 	classifierDef := json.RawMessage(`{
 		"batch_size": 1,
 		"grid_rows": 1,
@@ -206,33 +207,73 @@ func createDriftConfig() *drift.Config {
 		]
 	}`)
 
-	// Navigator: 4 (pos/dir) + 16 (link) = 20 inputs → 4 actions
+	// Navigator with CORRECT parallel architecture:
+	// IMPORTANT: Both branches receive the SAME FULL input (20 features)
+	//
+	// Input (20) = position(4) + neural_link(16)
+	//      ↓
+	// ┌─────────────────────────────────────────┐
+	// │          PARALLEL LAYER                 │
+	// │  Branch 1:          Branch 2:           │
+	// │  Dense(20→16)       Dense(20→4)         │
+	// │  (navigation)       + Softmax           │
+	// │      ↓                  ↓               │
+	// └─────────────────────────────────────────┘
+	//              concat(16+4=20)
+	//                    ↓
+	//              Dense(20→32)
+	//                    ↓
+	//               LSTM(32→16)
+	//                    ↓
+	//              Dense(16→4)
+	//
 	navigatorDef := json.RawMessage(`{
 		"batch_size": 1,
 		"grid_rows": 1,
 		"grid_cols": 1,
-		"layers_per_cell": 4,
+		"layers_per_cell": 5,
 		"layers": [
-			{"type": "dense", "input_size": 20, "output_size": 32, "activation": "leaky_relu"},
-			{"type": "lstm", "input_size": 8, "hidden_size": 8, "seq_length": 4},
-			{"type": "dense", "input_size": 32, "output_size": 16, "activation": "leaky_relu"},
-			{"type": "dense", "input_size": 16, "output_size": 4, "activation": "sigmoid"}
+			{
+				"type": "parallel",
+				"combine_mode": "concat",
+				"comment": "Both branches get full input(20)",
+				"branches": [
+					{
+						"type": "dense",
+						"input_size": 20,
+						"output_size": 16,
+						"activation": "leaky_relu",
+						"comment": "Navigation features from full input"
+					},
+					{
+						"type": "dense",
+						"input_size": 20,
+						"output_size": 4,
+						"activation": "none",
+						"comment": "Terrain logits (for softmax)"
+					}
+				]
+			},
+			{"type": "softmax", "softmax_variant": "grid", "softmax_rows": 5, "softmax_cols": 4, "temperature": 1.0, "comment": "Apply softmax to concat(16+4)=20"},
+			{"type": "dense", "input_size": 20, "output_size": 32, "activation": "leaky_relu", "comment": "Combine features"},
+			{"type": "lstm", "input_size": 32, "hidden_size": 16, "seq_length": 1, "comment": "Temporal reasoning"},
+			{"type": "dense", "input_size": 16, "output_size": 4, "activation": "sigmoid", "comment": "Action output"}
 		]
 	}`)
 
 	cfg.Models["classifier"] = classifierDef
 	cfg.Models["navigator"] = navigatorDef
 
-	// Neural link configuration
+	// Neural link configuration - now targets the second parallel branch
 	cfg.AddLink(drift.NeuralLinkConfig{
 		Name:         "terrain_to_nav",
 		SourceModel:  "classifier",
 		SourceLayer:  1,
 		TargetModel:  "navigator",
-		TargetOffset: 4,
+		TargetOffset: 4, // After position (4), into neural link branch
 		LinkSize:     16,
 		Enabled:      true,
-		Description:  "Classifier hidden → Navigator input for terrain awareness",
+		Description:  "Classifier hidden → Navigator parallel branch for terrain awareness",
 	})
 
 	return cfg
@@ -248,7 +289,7 @@ func trainClassifier(net *nn.Network, duration time.Duration) {
 	tween.Config.UseChainRule = true
 
 	correct, total := 0, 0
-	lr := float32(0.02)
+	lr := float32(0.05) // Higher LR for faster learning
 	start := time.Now()
 
 	for time.Since(start) < duration {
@@ -455,24 +496,30 @@ func runBenchmark(classifier, navigator *nn.Network, linkConfig drift.NeuralLink
 // ============================================================================
 
 func generateSensorData(terrain int) []float32 {
+	// VERY DISTINCT sensor patterns per terrain
 	// [friction, softness, slipperiness, roughness, moisture, density, temperature, stability]
 	var base []float32
 	switch terrain {
 	case TerrainRoad:
-		base = []float32{0.9, 0.1, 0.1, 0.3, 0.2, 0.9, 0.5, 0.95}
+		// High friction, hard, not slippery, smooth
+		base = []float32{1.0, 0.0, 0.0, 0.2, 0.1, 1.0, 0.5, 1.0}
 	case TerrainSand:
-		base = []float32{0.4, 0.85, 0.2, 0.8, 0.1, 0.3, 0.7, 0.4}
+		// Medium friction, very soft, not slippery, rough
+		base = []float32{0.4, 1.0, 0.1, 1.0, 0.0, 0.2, 0.9, 0.3}
 	case TerrainIce:
-		base = []float32{0.05, 0.05, 0.95, 0.1, 0.1, 0.9, 0.1, 0.6}
+		// No friction, hard, very slippery, smooth
+		base = []float32{0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.5}
 	case TerrainGrass:
-		base = []float32{0.6, 0.4, 0.3, 0.5, 0.6, 0.5, 0.5, 0.7}
+		// Good friction, medium soft, slightly slippery, medium rough
+		base = []float32{0.7, 0.5, 0.2, 0.5, 0.8, 0.4, 0.5, 0.7}
 	default:
 		base = []float32{0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5}
 	}
 
+	// Less noise to make patterns clearer
 	sensors := make([]float32, 8)
 	for i := range base {
-		sensors[i] = base[i] + (rand.Float32()-0.5)*0.15
+		sensors[i] = base[i] + (rand.Float32()-0.5)*0.1 // Reduced noise
 		sensors[i] = clamp(sensors[i], 0, 1)
 	}
 	return sensors

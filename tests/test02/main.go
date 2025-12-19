@@ -195,15 +195,17 @@ func createDriftConfig() *drift.Config {
 
 	// Classifier: 8 sensors → 4 terrain classes
 	// Hidden layer (index 1) outputs 16 neurons as neural link
+	// FIXED: Use softmax for multi-class classification (not sigmoid!)
 	classifierDef := json.RawMessage(`{
 		"batch_size": 1,
 		"grid_rows": 1,
 		"grid_cols": 1,
-		"layers_per_cell": 3,
+		"layers_per_cell": 4,
 		"layers": [
 			{"type": "dense", "input_size": 8, "output_size": 32, "activation": "leaky_relu"},
 			{"type": "dense", "input_size": 32, "output_size": 16, "activation": "leaky_relu"},
-			{"type": "dense", "input_size": 16, "output_size": 4, "activation": "sigmoid"}
+			{"type": "dense", "input_size": 16, "output_size": 4, "activation": "none"},
+			{"type": "softmax", "softmax_variant": "standard"}
 		]
 	}`)
 
@@ -284,18 +286,28 @@ func createDriftConfig() *drift.Config {
 // ============================================================================
 
 func trainClassifier(net *nn.Network, duration time.Duration) {
+	// ========================================
+	// StepTweenChain Training (Step forward + TweenStep with ChainRule)
+	// ========================================
+	fmt.Println("  Using StepTweenChain training...")
+
+	// Initialize StepState for step-based forward pass
 	state := net.InitStepState(8)
+
+	// Initialize TweenState with ChainRule enabled
 	tween := nn.NewTweenState(net, nil)
 	tween.Config.UseChainRule = true
+	tween.Config.ExplosionDetection = false
 
+	lr := float32(0.05)
 	correct, total := 0, 0
-	lr := float32(0.05) // Higher LR for faster learning
 	start := time.Now()
 
 	for time.Since(start) < duration {
 		terrain := rand.Intn(NumTerrains)
 		sensors := generateSensorData(terrain)
 
+		// Step forward (not regular ForwardCPU)
 		state.SetInput(sensors)
 		net.StepForward(state)
 		output := state.GetOutput()
@@ -305,11 +317,54 @@ func trainClassifier(net *nn.Network, duration time.Duration) {
 		}
 		total++
 
+		// TweenStep with ChainRule (this is StepTweenChain)
 		tween.TweenStep(net, sensors, terrain, NumTerrains, lr)
 	}
 
 	acc := float64(correct) / float64(total) * 100
 	fmt.Printf("Classifier trained: %.1f%% accuracy (%d samples)\n", acc, total)
+}
+
+// SyntheticSample holds a terrain sensor sample
+type SyntheticSample struct {
+	sensors []float32
+	terrain int
+}
+
+// generateSyntheticTerrainData creates synthetic training data with clear terrain patterns
+func generateSyntheticTerrainData(count int) []SyntheticSample {
+	samples := make([]SyntheticSample, count)
+
+	// Base patterns for each terrain (very distinct)
+	basePatterns := map[int][]float32{
+		TerrainRoad:  {1.0, 0.0, 0.0, 0.2, 0.1, 1.0, 0.5, 1.0}, // High friction, hard
+		TerrainSand:  {0.4, 1.0, 0.1, 1.0, 0.0, 0.2, 0.9, 0.3}, // Soft, rough
+		TerrainIce:   {0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.5}, // Slippery, cold
+		TerrainGrass: {0.7, 0.5, 0.2, 0.5, 0.8, 0.4, 0.5, 0.7}, // Medium friction, moist
+	}
+
+	for i := 0; i < count; i++ {
+		terrain := i % NumTerrains // Balanced classes
+		base := basePatterns[terrain]
+
+		sensors := make([]float32, 8)
+		for j := range base {
+			noise := (rand.Float32() - 0.5) * 0.15
+			sensors[j] = clamp(base[j]+noise, 0, 1)
+		}
+
+		samples[i] = SyntheticSample{
+			sensors: sensors,
+			terrain: terrain,
+		}
+	}
+
+	// Shuffle samples
+	rand.Shuffle(len(samples), func(i, j int) {
+		samples[i], samples[j] = samples[j], samples[i]
+	})
+
+	return samples
 }
 
 func trainNavigatorRoadOnly(net *nn.Network, linkSize int, duration time.Duration) {
